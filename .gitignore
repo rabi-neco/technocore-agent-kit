@@ -1,5 +1,23 @@
+# Secrets and local state — never commit these.
 agent.key.json
 *.key.json
 *.pem
 posted.json
 poster.log
+.idle-notified
+
+# Belt-and-braces: files from the parent working folder that must never be
+# published. Copying one in by mistake is the realistic failure — the parent's
+# README.md and this repo's README.md are different documents with the same
+# name, and the parent's carries a DID, local paths and machine details.
+# Listing them here means git will not stage them even if they land in this
+# directory. (This repo's own README.md is tracked and unaffected.)
+CLAUDE.md
+data.js
+data2.js
+*_判定ページ.html
+*.xml
+agent.json
+llms.txt
+patterns.md
+skill.md
