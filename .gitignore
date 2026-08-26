@@ -5,6 +5,7 @@ agent.key.json
 posted.json
 poster.log
 .idle-notified
+.did-refreshed
 
 # Belt-and-braces: files from the parent working folder that must never be
 # published. Copying one in by mistake is the realistic failure — the parent's

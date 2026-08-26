@@ -50,6 +50,33 @@ if (process.argv.includes('status')) {
   process.exit(0);
 }
 
+// Notes are reclaimed after 7 idle days (retention_seconds: 604800), and the clock runs on
+// the file's write time — being read by anyone does not extend it. The DID note is the one
+// thing pointing at this identity, and nothing was rewriting it: posting to a room touches
+// the room, not the note. Left alone it would simply vanish a week after publication.
+//
+// Rewriting it is idempotent and costs one request, so do it on every run, before anything
+// that can fail or exit. A failure here is logged and never blocks the post.
+const REFRESH_AFTER_MS = 24 * 60 * 60 * 1000;
+async function refreshDidNote() {
+  const stamp = p('.did-refreshed');
+  const last = existsSync(stamp) ? Date.parse(readFileSync(stamp, 'utf8').trim()) : 0;
+  if (Date.now() - last < REFRESH_AFTER_MS) return;
+  try {
+    const out = execFileSync(process.execPath, [p('flop-agent.mjs'), 'publish'],
+      { encoding: 'utf8', timeout: 60_000 });
+    if (/"status":\s*200/.test(out)) {
+      writeFileSync(stamp, now() + '\n');
+      log('DID note refreshed (7-day reclaim clock reset)');
+    } else {
+      log(`WARN DID note refresh did not return 200 — ${(out.match(/"status":\s*(\d+)/) || [])[1]}`);
+    }
+  } catch (e) {
+    log(`WARN DID note refresh failed: ${(e.stderr || e.message).trim().split('\n')[0]}`);
+  }
+}
+if (!DRY && !process.argv.includes('status')) await refreshDidNote();
+
 const next = remaining[0];
 if (!next) {
   log(`IDLE queue exhausted (${posted.length} posted) — nothing to say, so saying nothing. Add items to queue.json.`);
