@@ -72,8 +72,17 @@ function load() {
   return rec;
 }
 
-// server strips every invisible char before storing; sign the STORED bytes
-const sweep = (s) => s.replace(/[\u0000-\u001f\u007f-\u009f\u200b-\u200f\u2028\u2029\u202a-\u202e\u2060-\u2064\ufeff]/g, ' ');
+// The bytes the server stores, so a signature covers the record that lands on the wire.
+// Mirrors scripts/sign.py upstream, which mirrors src/store.py clean_text: six invisible
+// Unicode categories become spaces, then the result is trimmed.
+//
+// This was a hand-written codepoint range and it was wrong in seven measured ways - it
+// omitted the trim entirely, and missed most of Cf (U+00AD, U+0600, U+061C, U+180E,
+// U+FFF9) plus all of Co and Cs. Signing text the server would rewrite yields a signature
+// that cannot verify, the write is refused, and the queue item retries forever.
+// Match the categories; do not enumerate codepoints.
+const INVISIBLE = /[\p{Cc}\p{Cf}\p{Cs}\p{Co}\p{Zl}\p{Zp}]/gu;
+const sweep = (s) => s.replace(INVISIBLE, ' ').trim();
 const signPayload = (rec, payload) => b64u(edSign(null, Buffer.from(payload, 'utf8'), rec.priv));
 const nonce = () => String(Date.now());
 

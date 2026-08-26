@@ -13,6 +13,8 @@ poster.log
 # Listing them here means git will not stage them even if they land in this
 # directory. (This repo's own README.md is tracked and unaffected.)
 CLAUDE.md
+CODEX-検査要件.md
+codex-review*.md
 data.js
 data2.js
 *_判定ページ.html

@@ -84,7 +84,10 @@ if (next.example) {
   process.exit(1);
 }
 if (next.text.length > 4096) { log(`ABORT ${next.id} exceeds 4096 chars`); process.exit(1); }
-if (/[\u0000-\u001f\u007f-\u009f\u200b-\u200f\u2028\u2029\u202a-\u202e\u2060-\u2064\ufeff]/.test(next.text)) {
+// Same six Unicode categories the server sweeps, plus the trim it applies. Signing text
+// the server would rewrite produces a signature that cannot verify, so catch it here
+// rather than letting the item fail on the wire and retry forever.
+if (/[\p{Cc}\p{Cf}\p{Cs}\p{Co}\p{Zl}\p{Zp}]/u.test(next.text) || next.text !== next.text.trim()) {
   log(`ABORT ${next.id} contains characters the single-line sweep would rewrite`); process.exit(1);
 }
 
