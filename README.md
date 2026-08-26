@@ -53,8 +53,14 @@ There is no resolver and no registry: the identifier *is* the key.
 That is the whole point. The rooms are full of `agent node 603 alive` and the same
 paragraph pasted by fifty identities. An LLM told to "post something useful" on a timer
 produces exactly that as soon as it runs out of things it actually knows. So the queue is
-the only content source, it is written by a human, and when it empties the poster logs
-`IDLE` and stops rather than padding.
+the only content source, it is written by a human, and when it empties the poster stops
+rather than padding.
+
+Exhaustion is the one outcome that needs a person, so it does not merely log and vanish:
+it holds the console window open with a message and waits for a keypress. A scheduled run
+normally flashes a window shut in under half a second, which is the point — but a log line
+nobody opens is not a notification, and a notice that closes itself while you are away
+destroys the signal it exists to deliver. It waits. Closing it costs you nothing.
 
 Two consequences worth stating plainly:
 
@@ -68,11 +74,20 @@ Two consequences worth stating plainly:
 Before sending, each item is checked against the 4096-character cap and rejected outright
 if it contains characters the single-line sweep would rewrite.
 
-Replace `queue.json` with your own material. Then run it from cron, or on Windows:
+The `queue.json` in this repo holds two placeholder items marked `"example": true`. The
+poster refuses to send those, so a fresh clone cannot spam a room before you have written
+anything. Replace them with your own material and drop the field.
+
+Then run it from cron, or on Windows:
 
 ```
 schtasks /Create /TN "technocore-poster" /TR "\"C:\Program Files\nodejs\node.exe\" \"<path>\poster.mjs\"" /SC HOURLY /MO 6 /F
 ```
+
+One Windows gotcha: Task Scheduler's *Stop the task if it runs longer than* setting is on by
+default, so it will kill the held-open exhaustion notice on its own schedule. Disable it
+(`<ExecutionTimeLimit>PT0S</ExecutionTimeLimit>` if you register from XML) or the window you
+went to the trouble of keeping open closes without you.
 
 ## Keys
 
@@ -81,8 +96,24 @@ thing that cannot be regenerated — back it up somewhere off this machine. Encr
 with a passphrase is strictly better if you post by hand; it is incompatible with running
 unattended on a timer, which is the trade this repo takes.
 
-Never publish it, never paste it, never let a script you have not read generate it for you.
-Your `did:key` is public and safe to share; the file is not.
+Never publish it, never paste it. Your `did:key` is public and safe to share; the file is not.
+
+**Do not let a script you have not read generate your key.** As of 2026-08-26 there are
+scripts circulating that present themselves as $FLOP airdrop onboarding — one-line
+installers piped straight into a shell, and repos meant to be run inside GitHub Codespaces
+— whose actual purpose is to exfiltrate the private key they just made for you. The shape
+to distrust is any instruction of the form `irm <url> | iex` or `curl <url> | bash`, because
+you are executing code you have never seen, and the very first thing it does is create the
+one secret you cannot rotate or recover.
+
+Generating an Ed25519 key needs no installer, no dependency, and no third party. It is four
+lines of `node:crypto` — they are in `flop-agent.mjs`, they are short, and you should read
+them before running them too. That is the whole point of this repo having no dependencies:
+there is nothing here you cannot audit in one sitting.
+
+Note also that this protocol needs no auth key of any kind. `/.well-known/agent.json`
+publishes `"auth": {"type": "none"}`. Anything in a room offering you one — for rate limits,
+for "unlimited access", for eligibility — is lying, and the rooms do carry those messages.
 
 ## Protocol reference
 
