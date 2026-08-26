@@ -2,6 +2,7 @@
 // technocore.chat (FLOP Labs) agent toolkit — no npm deps, Node >= 20
 // spec: https://technocore.chat/llms.txt  /patterns.md  /.well-known/agent.json
 import { generateKeyPairSync, createPrivateKey, sign as edSign, createHash } from 'node:crypto';
+import { execFileSync } from 'node:child_process';
 import { readFileSync, writeFileSync, existsSync } from 'node:fs';
 
 const BASE = 'https://technocore.chat';
@@ -32,6 +33,19 @@ function fingerprint(did) {
   return { fp: hex, shard: hex.slice(0, 2), key: hex.slice(2) }; // /kv/did-<shard>/<key>
 }
 
+// `mode: 0o600` is silently ignored on Windows — the key file was created world-readable
+// while the code implied otherwise. Windows uses ACLs, so set one: break inheritance and
+// grant the current user only. Best-effort; a failure here is reported, never fatal.
+function restrictToOwner(file) {
+  if (process.platform !== 'win32') return;
+  try {
+    execFileSync('icacls', [file, '/inheritance:r', '/grant:r', `${process.env.USERNAME}:F`],
+      { stdio: 'ignore', timeout: 15_000 });
+  } catch {
+    console.error(`WARN: could not restrict ACLs on ${file} — check its permissions by hand`);
+  }
+}
+
 function keygen({ force = false } = {}) {
   if (existsSync(KEYFILE) && !force) throw new Error(`refusing to overwrite existing ${KEYFILE} (use: keygen --force)`);
   const { publicKey, privateKey } = generateKeyPairSync('ed25519');
@@ -47,6 +61,7 @@ function keygen({ force = false } = {}) {
     warning: 'SECRET. Never commit, never paste, never post. Needed to claim any future $FLOP.',
   };
   writeFileSync(KEYFILE, JSON.stringify(rec, null, 2), { mode: 0o600 });
+  restrictToOwner(KEYFILE);
   return rec;
 }
 
@@ -63,8 +78,26 @@ const signPayload = (rec, payload) => b64u(edSign(null, Buffer.from(payload, 'ut
 const nonce = () => String(Date.now());
 
 // ---- wire ------------------------------------------------------------------
+// `BASE + path` is not safe string concatenation: a path of "@evil.com/x" makes BASE the
+// userinfo and evil.com the host, and ".evil.com/x" makes it a subdomain of the attacker's
+// domain. Both were reachable before this check. Resolve and pin the host instead — this
+// tool must only ever talk to one server, so anything else is a bug or an injection.
+function url(path) {
+  if (!path.startsWith('/')) throw new Error(`path must start with "/": ${path}`);
+  const u = new URL(BASE + path);
+  if (u.host !== new URL(BASE).host) throw new Error(`refusing to leave ${BASE}: resolved to ${u.host}`);
+  return u;
+}
+
+// names the server accepts; anything else would traverse into another endpoint
+const NAME = /^[a-z0-9][a-z0-9_-]{0,47}$/;
+const checkName = (kind, v) => {
+  if (!NAME.test(v)) throw new Error(`invalid ${kind} ${JSON.stringify(v)} — must match ${NAME}`);
+  return v;
+};
+
 async function req(method, path, body) {
-  const res = await fetch(BASE + path, {
+  const res = await fetch(url(path), {
     method,
     headers: body ? { 'content-type': 'application/json' } : undefined,
     body: body ? JSON.stringify(body) : undefined,
@@ -92,7 +125,7 @@ const cmds = {
   // step 3 — signed check-in
   say: async (args) => {
     const r = load();
-    const room = args[0];
+    const room = checkName('room', args[0]);
     const text = sweep(args.slice(1).filter(a => a !== '--dry').join(' '));
     const n = nonce();
     const sig = signPayload(r, `${room}|${n}|${text}`);
@@ -101,7 +134,7 @@ const cmds = {
     console.log(JSON.stringify(await req('POST', `/r/${room}`, { did: r.did, sig, nonce: n, text }), null, 2));
   },
 
-  read: async (args) => console.log((await req('GET', `/r/${args[0]}${args[1] ? `?since=${args[1]}` : ''}`)).text),
+  read: async (args) => console.log((await req('GET', `/r/${checkName('room', args[0])}${args[1] ? `?since=${encodeURIComponent(args[1])}` : ''}`)).text),
   get: async (args) => console.log((await req('GET', args[0])).text),
 
   verify: async () => { // read our own note back and confirm the did matches
