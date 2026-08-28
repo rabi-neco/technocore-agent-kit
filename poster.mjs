@@ -77,6 +77,46 @@ async function refreshDidNote() {
 }
 if (!DRY && !process.argv.includes('status')) await refreshDidNote();
 
+// The airdrop's main phase is testnet inference, not posting here — so the event worth not
+// missing is the faucet opening, and that shows up in the served API surface before it
+// shows up in an announcement. One unauthenticated GET. Every one of these terms is 0
+// occurrences today, so any of them appearing is the signal; the path count alone is not,
+// because it already moved 24 -> 25 -> 26 without a faucet.
+const WATCH = ['faucet', 'testnet', 'inference', 'airdrop', 'mint'];
+async function checkForTestnet() {
+  try {
+    const res = await fetch('https://technocore.chat/openapi.json');
+    if (!res.ok) { log(`WARN openapi check returned ${res.status}`); return null; }
+    const body = await res.text();
+    const doc = JSON.parse(body);
+    const paths = Object.keys(doc.paths || {}).length;
+    const hay = body.toLowerCase();
+    const found = WATCH.filter((w) => hay.includes(w));
+    log(`openapi: ${paths} paths, watched terms ${found.length ? found.join(',') : 'none'}`);
+    if (!found.length) return null;
+    return [
+      '  ★ technocore の API に新しい語が現れました',
+      '',
+      `    検出: ${found.join(', ')}`,
+      `    パス数: ${paths}`,
+      '',
+      '    Testnet / Faucet が始まった可能性があります。',
+      '    エアドロの本戦は Technocore への投稿ではなく、',
+      '    Testnet での Inference 利用です。',
+      '',
+      '  ----------------------------------------------------------------',
+      '    ただし、ここで見えたことは入口の確認にはなりません。',
+      '    必ず Flop Labs 公式X または公式サイトからリンクを辿ること。',
+      '    検索結果・DM・room の投稿にある URL は踏まない。',
+      '  ----------------------------------------------------------------',
+    ];
+  } catch (e) {
+    log(`WARN openapi check failed: ${e.message}`);
+    return null;
+  }
+}
+const testnetNotice = (!DRY && !process.argv.includes('status')) ? await checkForTestnet() : null;
+
 const next = remaining[0];
 if (!next) {
   log(`IDLE queue exhausted (${posted.length} posted) — nothing to say, so saying nothing. Add items to queue.json.`);
@@ -84,6 +124,7 @@ if (!next) {
     // The one line that is an instruction gets its own block. Buried in a paragraph of
     // equal-weight text it reads as prose; on its own it reads as the thing to do next.
     await holdOpen([
+      ...(testnetNotice ? [...testnetNotice, '', ''] : []),
       '  ★ 投稿キューが空になりました（ネタ切れ）',
       '',
       `    これまでに ${posted.length} 件を投稿済みです。`,
@@ -142,3 +183,8 @@ posted.push({ id: next.id, room, seq, at: now() });
 writeFileSync(p('posted.json'), JSON.stringify(posted, null, 2));
 
 log(`OK ${next.id} seq ${seq} (${remaining.length - 1} left in queue)`);
+
+// Post first, then hold — the post is cheap and should not be lost to a window waiting for
+// someone who is away. Shown on every run while the terms are present, not once: this is
+// the event the whole exercise is aimed at, and a notice you can miss is not a notice.
+if (testnetNotice) await holdOpen(testnetNotice);
