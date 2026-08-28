@@ -60,6 +60,19 @@ describe('a post whose outcome is unknown must not be sent again', () => {
     assert.match(r.stdout + r.stderr, /not resending/);
   }));
 
+  // ...but not when the record is merely stale. If the post is already written down as
+  // sent, only the delete failed, and stopping to ask about it would halt the automation
+  // over a filesystem hiccup that cost nothing.
+  test('a pending record for something already posted is cleared, not raised', withBox((box, poster) => {
+    box.write('queue.json', [{ id: 'x', room: 'lobby', text: 'hello', example: true }]);
+    box.write('posted.json', [{ id: 'x', room: 'lobby', seq: '1', at: 'earlier' }]);
+    box.write('.pending.json', { id: 'x', room: 'lobby', at: 'earlier' });
+    const r = poster();
+    assert.match(r.stdout, /stale/);
+    assert.doesNotMatch(r.stdout, /not resending/);
+    assert.equal(existsSync(join(box.dir, '.pending.json')), false);
+  }));
+
   // The counterpart, and the bug this pairing was written for: a refusal that happened
   // before any request is not unknown at all. Leaving a pending record for it halted the
   // whole automation on a typo while warning the post might already exist.
@@ -84,6 +97,22 @@ describe('oversized and invisible content is caught before signing', () => {
     box.write('queue.json', [{ id: 'big', room: 'lobby', text: 'a'.repeat(4097) }]);
     box.write('posted.json', []);
     assert.match(poster().stdout, /ABORT.*4096/);
+  }));
+
+  // The cap is codepoints, the same unit the server and the child count in. Measuring
+  // UTF-16 units here made an emoji cost two against a limit it costs one against
+  // everywhere else, so the poster refused messages the server would have taken.
+  test('counts codepoints, not UTF-16 units', withBox((box, poster) => {
+    box.write('queue.json', [{ id: 'astral', room: 'lobby', text: '𝄞'.repeat(2049) }]);
+    box.write('posted.json', []);
+    const out = poster().stdout;
+    assert.doesNotMatch(out, /ABORT/, '2049 codepoints is under the cap');
+  }));
+
+  test('rejects an item whose text is not a string', withBox((box, poster) => {
+    box.write('queue.json', [{ id: 'notext', room: 'lobby' }]);
+    box.write('posted.json', []);
+    assert.match(poster().stdout, /ABORT.*no text/);
   }));
 
   test('characters the sweep would rewrite', withBox((box, poster) => {

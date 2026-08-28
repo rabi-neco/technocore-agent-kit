@@ -167,6 +167,45 @@ const testnetNotice = (!DRY && !process.argv.includes('status')) ? await checkFo
 // three more of them over the next fifteen minutes. Letting the loop drain exits cleanly.
 async function main() {
 
+  // Reconcile the pending record before deciding what to do, not after choosing an item.
+  // Placed later, an exhausted queue returned first and a leftover record was neither
+  // cleared nor reported — it then surfaced on the next refill, about a post long since
+  // written down as sent.
+  if (!DRY && existsSync(PENDING)) {
+    let stale = {};
+    try { stale = JSON.parse(readFileSync(PENDING, 'utf8')); } catch {}
+
+    // The record can outlive the thing it was recording: if the post was written down as
+    // sent and only the delete failed, the outcome is not unknown at all. Reconcile against
+    // posted.json before stopping, so a filesystem hiccup does not halt the automation and
+    // ask a person to investigate something that already succeeded.
+    if (stale.id && done.has(stale.id)) {
+      log(`pending record for ${stale.id} is stale — it is already recorded as posted; clearing`);
+      try { unlinkSync(PENDING); } catch {}
+    } else {
+
+    log(`ABORT a previous send of ${stale.id ?? '?'} to /r/${stale.room ?? '?'} left no result — not resending`);
+    await holdOpen([
+      '  ★ 前回の投稿が、結果を確認できないまま終わっています',
+      '',
+      `    項目: ${stale.id ?? '不明'}`,
+      `    部屋: ${stale.room ?? '不明'}`,
+      `    時刻: ${stale.at ?? '不明'}`,
+      '',
+      '    サーバ側では成功しているかもしれません。',
+      '    自動で送り直すと二重投稿になり、取り消せません。',
+      '',
+      '  ----------------------------------------------------------------',
+      '    Claude に、次のとおり伝えてください:',
+      '',
+      '        前回の投稿を確認して',
+      '',
+      '  ----------------------------------------------------------------',
+    ]);
+    return 1;
+    }
+  }
+
   const next = remaining[0];
   if (!next) {
     log(`IDLE queue exhausted (${posted.length} posted) — nothing to say, so saying nothing. Add items to queue.json.`);
@@ -201,7 +240,11 @@ async function main() {
                 '  Write your own items (drop the "example" field) and run again.\n');
     return 1;
   }
-  if (next.text.length > 4096) { log(`ABORT ${next.id} exceeds 4096 chars`); return 1; }
+  // Codepoints, matching the server and the child. Counting UTF-16 units here while the
+  // child counted codepoints meant an emoji cost two against the cap in one place and one in
+  // the other, so a message the server would have accepted was refused before it was sent.
+  if (typeof next.text !== 'string') { log(`ABORT ${next.id} has no text`); return 1; }
+  if ([...next.text].length > 4096) { log(`ABORT ${next.id} exceeds 4096 characters`); return 1; }
   // Same six Unicode categories the server sweeps, plus the trim it applies. Signing text
   // the server would rewrite produces a signature that cannot verify, so catch it here
   // rather than letting the item fail on the wire and retry forever.
@@ -214,31 +257,8 @@ async function main() {
   // A leftover pending record means the previous run sent something and never got to write
   // down what happened. Re-sending is the wrong reflex: the server may well have stored it,
   // and a duplicate cannot be withdrawn. Stop and let a person look, rather than guessing.
-  if (!DRY && existsSync(PENDING)) {
-    let stale = {};
-    try { stale = JSON.parse(readFileSync(PENDING, 'utf8')); } catch {}
-    log(`ABORT a previous send of ${stale.id ?? '?'} to /r/${stale.room ?? '?'} left no result — not resending`);
-    await holdOpen([
-      '  ★ 前回の投稿が、結果を確認できないまま終わっています',
-      '',
-      `    項目: ${stale.id ?? '不明'}`,
-      `    部屋: ${stale.room ?? '不明'}`,
-      `    時刻: ${stale.at ?? '不明'}`,
-      '',
-      '    サーバ側では成功しているかもしれません。',
-      '    自動で送り直すと二重投稿になり、取り消せません。',
-      '',
-      '  ----------------------------------------------------------------',
-      '    Claude に、次のとおり伝えてください:',
-      '',
-      '        前回の投稿を確認して',
-      '',
-      '  ----------------------------------------------------------------',
-    ]);
-    return 1;
-  }
 
-  log(`POST ${next.id} -> /r/${room} (${next.text.length} chars)${DRY ? ' [DRY]' : ''}`);
+  log(`POST ${next.id} -> /r/${room} (${[...next.text].length} chars)${DRY ? ' [DRY]' : ''}`);
 
   let out;
   try {
@@ -281,11 +301,31 @@ async function main() {
 
   // The server answered, so the outcome IS known — a non-200 means it did not store the
   // message, and retrying is safe. Clear the pending record on every one of these paths.
-  const clearPending = () => { try { unlinkSync(PENDING); } catch {} };
+  // A delete that fails for any reason other than "it was already gone" leaves a marker that
+  // stops the next run, so say so now rather than letting the automation stop silently a day
+  // later with no explanation.
+  const clearPending = () => {
+    try { unlinkSync(PENDING); }
+    catch (e) { if (e.code !== 'ENOENT') log(`WARN could not clear ${PENDING}: ${e.code} — the next run will stop on it`); }
+  };
 
   const status = result.status;
-  if (status === 429) { clearPending(); log(`FAIL ${next.id}: rate limited — will retry next run`); return 1; }
-  if (status !== 200) { clearPending(); log(`FAIL ${next.id}: status ${status} — will retry next run`); return 1; }
+  // Only the refusals the API actually documents are safe to retry: each of these means the
+  // server declined to store the message, so sending it again cannot duplicate anything.
+  // A 5xx or anything unlisted is a different claim — it may have been stored before the
+  // response failed — so it is treated as unknown and keeps the pending record, exactly like
+  // a dropped connection. Guessing "probably not saved" is how a duplicate gets posted, and
+  // a duplicate cannot be withdrawn.
+  const DECLINED = new Set([400, 403, 404, 409, 413, 422, 429]);
+  if (status !== 200) {
+    if (DECLINED.has(status)) {
+      clearPending();
+      log(`FAIL ${next.id}: status ${status} (server declined it) — will retry next run`);
+    } else {
+      log(`FAIL ${next.id}: status ${status} — outcome unknown, not retrying automatically`);
+    }
+    return 1;
+  }
 
   // the reply's trailer names the newest seq, which is the message we just wrote
   const seq = (String(result.text || '').match(/next:\s*\/r\/[^?]+\?since=(\d+)/) || [])[1] || '?';

@@ -19,6 +19,7 @@ posted.json.tmp
 CLAUDE.md
 CODEX-検査要件.md
 check-publish.mjs
+audit-claude-md.mjs
 codex-review*.md
 data.js
 data2.js
