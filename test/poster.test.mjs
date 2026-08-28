@@ -92,6 +92,21 @@ describe('a post whose outcome is unknown must not be sent again', () => {
   }
 });
 
+describe('clearing the pending marker', () => {
+  // Every path that removes it must go through the one function that reports a failure.
+  // Three call sites removed it directly and two of them wrote `catch {}`, so a delete that
+  // failed left a marker that stopped the next run with nothing on screen saying why. This
+  // asserts on the source because the failure it guards against needs a locked file to
+  // reproduce, and a test that cannot run is not a guard.
+  test('no path deletes it without reporting a failure', () => {
+    const src = readFileSync(new URL('../poster.mjs', import.meta.url), 'utf8');
+    const swallowed = src.match(/unlinkSync\(PENDING\)[^\n]*catch\s*\{\s*\}/g) ?? [];
+    assert.equal(swallowed.length, 0, 'use dropPending() rather than swallowing the error');
+    const direct = src.match(/unlinkSync\(PENDING\)/g) ?? [];
+    assert.equal(direct.length, 1, 'only dropPending() should call unlinkSync on the marker');
+  });
+});
+
 describe('oversized and invisible content is caught before signing', () => {
   test('over the cap', withBox((box, poster) => {
     box.write('queue.json', [{ id: 'big', room: 'lobby', text: 'a'.repeat(4097) }]);

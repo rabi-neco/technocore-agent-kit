@@ -79,6 +79,17 @@ const done = new Set(posted.map(x => x.id));
 // task's retry sends it again under a fresh nonce — a duplicate nobody asked for.
 const PENDING = p('.pending.json');
 
+// One place that removes it, so every path reports a failure the same way. A delete that
+// fails for any reason other than "already gone" leaves a marker that stops the next run —
+// silently, a day later, with nothing on screen explaining why. Three call sites used to
+// swallow that; two of them by writing `catch {}`.
+function dropPending() {
+  try { unlinkSync(PENDING); }
+  catch (e) {
+    if (e.code !== 'ENOENT') log(`WARN could not clear ${PENDING}: ${e.code} — the next run will stop on it`);
+  }
+}
+
 const remaining = queue.filter(x => !done.has(x.id));
 
 if (process.argv.includes('status')) {
@@ -181,7 +192,7 @@ async function main() {
     // ask a person to investigate something that already succeeded.
     if (stale.id && done.has(stale.id)) {
       log(`pending record for ${stale.id} is stale — it is already recorded as posted; clearing`);
-      try { unlinkSync(PENDING); } catch {}
+      dropPending();
     } else {
 
     log(`ABORT a previous send of ${stale.id ?? '?'} to /r/${stale.room ?? '?'} left no result — not resending`);
@@ -273,7 +284,7 @@ async function main() {
     // have been posted". The item still needs fixing, which is why this stops rather than
     // skipping ahead, but say what is actually wrong.
     if (e.status === 2) {
-      try { unlinkSync(PENDING); } catch {}
+      dropPending();
       log(`ABORT ${next.id} was refused before sending: ${why} — fix the item in queue.json`);
       return 1;
     }
@@ -301,14 +312,6 @@ async function main() {
 
   // The server answered, so the outcome IS known — a non-200 means it did not store the
   // message, and retrying is safe. Clear the pending record on every one of these paths.
-  // A delete that fails for any reason other than "it was already gone" leaves a marker that
-  // stops the next run, so say so now rather than letting the automation stop silently a day
-  // later with no explanation.
-  const clearPending = () => {
-    try { unlinkSync(PENDING); }
-    catch (e) { if (e.code !== 'ENOENT') log(`WARN could not clear ${PENDING}: ${e.code} — the next run will stop on it`); }
-  };
-
   const status = result.status;
   // Only the refusals the API actually documents are safe to retry: each of these means the
   // server declined to store the message, so sending it again cannot duplicate anything.
@@ -319,7 +322,7 @@ async function main() {
   const DECLINED = new Set([400, 403, 404, 409, 413, 422, 429]);
   if (status !== 200) {
     if (DECLINED.has(status)) {
-      clearPending();
+      dropPending();
       log(`FAIL ${next.id}: status ${status} (server declined it) — will retry next run`);
     } else {
       log(`FAIL ${next.id}: status ${status} — outcome unknown, not retrying automatically`);
@@ -335,7 +338,7 @@ async function main() {
   const tmp = p('posted.json.tmp');
   writeFileSync(tmp, JSON.stringify(posted, null, 2));
   renameSync(tmp, p('posted.json'));
-  clearPending();
+  dropPending();
 
   log(`OK ${next.id} seq ${seq} (${remaining.length - 1} left in queue)`);
 
