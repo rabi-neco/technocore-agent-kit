@@ -216,11 +216,16 @@ const cmds = {
 const [cmd, ...args] = process.argv.slice(2);
 if (!cmds[cmd]) { console.error(`usage: node flop-agent.mjs <${Object.keys(cmds).join('|')}> [args] [--dry]`); process.exit(1); }
 
-// Anything starting with "-" that is not a flag this tool knows is a typo, and a typo that
-// falls through is a public write the author did not intend: `say ... --dri` posted for
-// real, because only the exact string "--dry" suppressed the send. Refuse before the wire.
+// A typo that falls through is a public write the author did not intend: `say ... --dri`
+// posted for real, because only the exact string "--dry" suppressed the send.
+//
+// Only single tokens that look like flags count. A first cut tested every argument and so
+// rejected any message beginning with a hyphen — "- starts with dash" was read as an
+// unknown option. Message text is free-form and often starts with punctuation; a guard that
+// blocks legitimate content is a worse bug than the one it fixes.
 const KNOWN = new Set(['--dry', '--force']);
-const stray = args.filter((a) => a.startsWith('-') && !KNOWN.has(a));
+const looksLikeFlag = (a) => /^--?[A-Za-z][A-Za-z0-9-]*$/.test(a);
+const stray = args.filter((a) => looksLikeFlag(a) && !KNOWN.has(a));
 if (stray.length) {
   console.error(`unknown option${stray.length > 1 ? 's' : ''}: ${stray.join(', ')} — known: ${[...KNOWN].join(', ')}`);
   process.exit(1);
