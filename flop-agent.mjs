@@ -36,13 +36,28 @@ function fingerprint(did) {
 // `mode: 0o600` is silently ignored on Windows — the key file was created world-readable
 // while the code implied otherwise. Windows uses ACLs, so set one: break inheritance and
 // grant the current user only. Best-effort; a failure here is reported, never fatal.
+// Throws rather than warning. This used to log a warning and return, so a failed icacls —
+// or an unset USERNAME, which builds the argument "undefined:F" — left the private key on
+// disk inheriting whatever the parent directory grants, while keygen reported success. A
+// key the caller believes is protected and is not is worse than no key: fail loudly.
 function restrictToOwner(file) {
   if (process.platform !== 'win32') return;
-  try {
-    execFileSync('icacls', [file, '/inheritance:r', '/grant:r', `${process.env.USERNAME}:F`],
-      { stdio: 'ignore', timeout: 15_000 });
-  } catch {
-    console.error(`WARN: could not restrict ACLs on ${file} — check its permissions by hand`);
+  const user = process.env.USERNAME;
+  if (!user) throw new Error('USERNAME is not set — cannot scope the key file ACL to its owner');
+  execFileSync('icacls', [file, '/inheritance:r', '/grant:r', `${user}:F`],
+    { stdio: 'ignore', timeout: 15_000 });
+
+  // /inheritance:r drops inherited ACEs and /grant:r replaces only this user's explicit one,
+  // so an explicit ACE for someone else would survive both. Read the result back and refuse
+  // anything that is not exactly this account.
+  const acl = execFileSync('powershell.exe',
+    ['-NoProfile', '-NonInteractive', '-Command',
+     `(Get-Acl -LiteralPath '${file.replace(/'/g, "''")}').Access | ForEach-Object { $_.IdentityReference.ToString() }`],
+    { encoding: 'utf8', timeout: 20_000 });
+  const others = acl.split(/\r?\n/).map((s) => s.trim()).filter(Boolean)
+    .filter((id) => !id.toLowerCase().endsWith(`\\${user.toLowerCase()}`));
+  if (others.length) {
+    throw new Error(`key file ACL still grants: ${others.join(', ')} — refusing to leave the key readable`);
   }
 }
 
@@ -106,8 +121,13 @@ const checkName = (kind, v) => {
 };
 
 async function req(method, path, body) {
+  // url() pins the first hop only, and fetch follows redirects by default — a 307 from the
+  // pinned host would carry the DID, signature, nonce and body to wherever it pointed. This
+  // protocol never redirects, so treat one as an error rather than a route.
   const res = await fetch(url(path), {
     method,
+    redirect: 'error',
+    signal: AbortSignal.timeout(30_000),
     headers: body ? { 'content-type': 'application/json' } : undefined,
     body: body ? JSON.stringify(body) : undefined,
   });
@@ -138,7 +158,11 @@ const cmds = {
     const text = sweep(args.slice(1).filter(a => a !== '--dry').join(' '));
     const n = nonce();
     const sig = signPayload(r, `${room}|${n}|${text}`);
-    console.log(`POST /r/${room}\n  did: ${r.did}\n  nonce: ${n}\n  text: ${text}`);
+    // The human-readable echo goes to stderr so it can never be mistaken for the result.
+    // A caller parsing stdout used to see the post's own body first: a message containing
+    // the characters "status": 200 made a failed write read as a success, and one
+    // containing "status": 429 made a success read as rate-limited. Verified both.
+    console.error(`POST /r/${room}\n  did: ${r.did}\n  nonce: ${n}\n  text: ${text}`);
     if (args.includes('--dry')) return;
     console.log(JSON.stringify(await req('POST', `/r/${room}`, { did: r.did, sig, nonce: n, text }), null, 2));
   },

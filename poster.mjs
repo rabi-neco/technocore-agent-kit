@@ -85,9 +85,14 @@ if (!DRY && !process.argv.includes('status')) await refreshDidNote();
 const WATCH = ['faucet', 'testnet', 'inference', 'airdrop', 'mint'];
 async function checkForTestnet() {
   try {
-    const res = await fetch('https://technocore.chat/openapi.json');
+    // Bounded on purpose: this check must never be able to stall the post it runs before.
+    // The task has no execution time limit (that is deliberate, for the exhaustion notice),
+    // so a slow or endless response here would hang the run with nothing on screen.
+    const res = await fetch('https://technocore.chat/openapi.json',
+      { redirect: 'error', signal: AbortSignal.timeout(20_000) });
     if (!res.ok) { log(`WARN openapi check returned ${res.status}`); return null; }
     const body = await res.text();
+    if (body.length > 2_000_000) { log('WARN openapi response too large to inspect'); return null; }
     const doc = JSON.parse(body);
     const paths = Object.keys(doc.paths || {}).length;
     const hay = body.toLowerCase();
@@ -165,20 +170,32 @@ log(`POST ${next.id} -> /r/${room} (${next.text.length} chars)${DRY ? ' [DRY]' :
 let out;
 try {
   out = execFileSync(process.execPath, [p('flop-agent.mjs'), 'say', room, next.text, ...(DRY ? ['--dry'] : [])],
-    { encoding: 'utf8', timeout: 60_000 });
+    { encoding: 'utf8', timeout: 60_000, stdio: ['ignore', 'pipe', 'inherit'] });
 } catch (e) {
   log(`FAIL ${next.id}: ${(e.stderr || e.message).trim().split('\n')[0]} — will retry next run`);
   process.exit(1);
 }
 
-if (DRY) { console.log(out); process.exit(0); }
+if (DRY) { process.exit(0); } // the child echoed the composed message to stderr already
 
-const status = (out.match(/"status":\s*(\d+)/) || [])[1];
-if (status === '429') { log(`FAIL ${next.id}: rate limited — will retry next run`); process.exit(1); }
-if (status !== '200') { log(`FAIL ${next.id}: status ${status} — will retry next run`); process.exit(1); }
+// Parse the child's stdout as the JSON it is, rather than regexing for the first thing that
+// looks like a status. The post's own body used to be printed to stdout first, so a message
+// containing the characters "status": 200 made a failed write parse as a success — and
+// "status": 429 made a success parse as rate-limited. Both reproduced. The echo now goes to
+// stderr, and this refuses to guess if stdout is not the single object it expects.
+let result;
+try {
+  result = JSON.parse(out);
+} catch {
+  log(`FAIL ${next.id}: could not parse the result as JSON — treating as unsent, will retry`);
+  process.exit(1);
+}
+const status = result.status;
+if (status === 429) { log(`FAIL ${next.id}: rate limited — will retry next run`); process.exit(1); }
+if (status !== 200) { log(`FAIL ${next.id}: status ${status} — will retry next run`); process.exit(1); }
 
 // the reply's trailer names the newest seq, which is the message we just wrote
-const seq = (out.match(/next:\s*\/r\/[^?]+\?since=(\d+)/) || [])[1] || '?';
+const seq = (String(result.text || '').match(/next:\s*\/r\/[^?]+\?since=(\d+)/) || [])[1] || '?';
 posted.push({ id: next.id, room, seq, at: now() });
 writeFileSync(p('posted.json'), JSON.stringify(posted, null, 2));
 
