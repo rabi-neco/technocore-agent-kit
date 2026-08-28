@@ -238,9 +238,19 @@ try {
   out = execFileSync(process.execPath, [p('flop-agent.mjs'), 'say', room, next.text, ...(DRY ? ['--dry'] : [])],
     { encoding: 'utf8', timeout: 60_000, stdio: ['ignore', 'pipe', 'inherit'] });
 } catch (e) {
-  // The child failed to produce a result. Whether the write reached the server is exactly
-  // what we cannot tell, so the pending record stays and the next run stops on it.
-  log(`FAIL ${next.id}: ${(e.stderr || e.message).trim().split('\n')[0]} — outcome unknown, not retrying automatically`);
+  const why = (e.stderr || e.message).trim().split('\n').pop();
+  // Exit 2 is the child saying it refused before sending anything — a bad room name, empty
+  // or oversized text. Nothing reached the server, so there is nothing to reconcile: drop
+  // the pending record rather than halting every future run with a false "this may already
+  // have been posted". The item still needs fixing, which is why this stops rather than
+  // skipping ahead, but say what is actually wrong.
+  if (e.status === 2) {
+    try { unlinkSync(PENDING); } catch {}
+    log(`ABORT ${next.id} was refused before sending: ${why} — fix the item in queue.json`);
+    process.exit(1);
+  }
+  // Anything else: the request may have been served and we will never know from here.
+  log(`FAIL ${next.id}: ${why} — outcome unknown, not retrying automatically`);
   process.exit(1);
 }
 

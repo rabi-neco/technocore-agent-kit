@@ -146,7 +146,13 @@ const checkName = (kind, v) => {
   return v;
 };
 
+// Set the moment a request is attempted, so a caller can tell "refused before anything left
+// this machine" from "we tried and do not know what happened". The distinction decides
+// whether resending is safe, and only this code knows it.
+let attempted = false;
+
 async function req(method, path, body) {
+  attempted = true;
   // url() pins the first hop only, and fetch follows redirects by default — a 307 from the
   // pinned host would carry the DID, signature, nonce and body to wherever it pointed. This
   // protocol never redirects, so treat one as an error rather than a route.
@@ -231,4 +237,8 @@ if (stray.length) {
   process.exit(1);
 }
 
-cmds[cmd](args).catch(e => { console.error('ERROR:', e.message); process.exit(1); });
+// Exit 2 means nothing was sent — a bad room name, empty or oversized text, an unreadable
+// key. Exit 1 means a request went out and its fate is unknown. A caller that treats those
+// the same either resends what may already be stored, or halts on something that provably
+// never left the machine.
+cmds[cmd](args).catch(e => { console.error('ERROR:', e.message); process.exit(attempted ? 1 : 2); });
