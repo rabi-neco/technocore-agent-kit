@@ -16,6 +16,14 @@ export function sandbox({ withKey = true } = {}) {
   const dir = mkdtempSync(join(tmpdir(), 'flop-test-'));
   for (const f of ['flop-agent.mjs', 'poster.mjs']) cpSync(join(SRC, f), join(dir, f));
   if (withKey) run(dir, 'flop-agent.mjs', ['keygen']);
+
+  // The poster republishes its DID note unless one was written in the last day, and each
+  // sandbox has a fresh key — so without this, every poster test tried to write a junk note
+  // to the live public store under a throwaway identity. It failed here only because that
+  // namespace happened to be full. Backdating the marker by an hour makes the refresh a
+  // no-op: the tests exercise the poster, not the protocol's shared storage.
+  writeFileSync(join(dir, '.did-refreshed'), new Date(Date.now() - 3600_000).toISOString());
+
   return {
     dir,
     write: (name, value) => writeFileSync(join(dir, name),

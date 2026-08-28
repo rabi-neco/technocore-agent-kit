@@ -91,8 +91,12 @@ describe('the sweep must match the server, or the signature covers bytes it neve
 
 describe('option parsing — a typo must not post, and punctuation must not be a typo', () => {
   for (const flag of ['--dri', '--help', '-x']) {
+    // --dry as well, deliberately. The guard runs before the command does, so these cannot
+    // send today — but if it were ever moved after dispatch, these three would start posting
+    // to the live lobby, and this suite is published for other people to run. The extra flag
+    // costs nothing and the assertion still fails if the guard stops working.
     test(`refuses ${flag}`, () => {
-      const r = agent('say', 'lobby', 'text', flag);
+      const r = agent('say', 'lobby', 'text', flag, '--dry');
       assert.notEqual(r.code, 0);
       assert.match(r.stderr, /unknown option/);
     });
