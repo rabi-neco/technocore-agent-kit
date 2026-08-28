@@ -6,6 +6,9 @@ posted.json
 poster.log
 .idle-notified
 .did-refreshed
+.pending.json
+.nonces.json
+posted.json.tmp
 
 # Belt-and-braces: files from the parent working folder that must never be
 # published. Copying one in by mistake is the realistic failure — the parent's
@@ -15,6 +18,7 @@ poster.log
 # directory. (This repo's own README.md is tracked and unaffected.)
 CLAUDE.md
 CODEX-検査要件.md
+check-publish.mjs
 codex-review*.md
 data.js
 data2.js

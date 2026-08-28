@@ -3,7 +3,7 @@
 // Deliberately NOT generative: it never invents a message. Queue empty => it stops
 // posting rather than emitting filler. Nothing read from the network is ever posted.
 import { execFileSync } from 'node:child_process';
-import { readFileSync, writeFileSync, existsSync, appendFileSync } from 'node:fs';
+import { readFileSync, writeFileSync, existsSync, appendFileSync, unlinkSync, renameSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 
@@ -38,9 +38,46 @@ function holdOpen(lines) {
 }
 
 const DRY = process.argv.includes('--dry');
-const queue = JSON.parse(readFileSync(p('queue.json'), 'utf8'));
-const posted = existsSync(p('posted.json')) ? JSON.parse(readFileSync(p('posted.json'), 'utf8')) : [];
+
+// Read state defensively. A truncated write, a hand edit, or a deleted posted.json used to
+// be indistinguishable from a clean first run — and "no record of anything posted" means
+// re-posting the entire queue. Refuse to act on state that does not parse or does not have
+// the shape expected, rather than treating damage as a fresh start.
+function readJsonArray(file, { required }) {
+  if (!existsSync(p(file))) {
+    if (required) throw new Error(`${file} is missing`);
+    return [];
+  }
+  let v;
+  try { v = JSON.parse(readFileSync(p(file), 'utf8')); }
+  catch (e) { throw new Error(`${file} is not valid JSON (${e.message}) — fix or restore it; refusing to post`); }
+  if (!Array.isArray(v)) throw new Error(`${file} must be a JSON array`);
+  for (const [i, x] of v.entries()) {
+    if (!x || typeof x !== 'object' || typeof x.id !== 'string' || !x.id) {
+      throw new Error(`${file}[${i}] has no string id`);
+    }
+  }
+  const ids = v.map((x) => x.id);
+  const dupe = ids.find((id, i) => ids.indexOf(id) !== i);
+  if (dupe) throw new Error(`${file} has a duplicate id: ${dupe}`);
+  return v;
+}
+
+let queue, posted;
+try {
+  queue = readJsonArray('queue.json', { required: true });
+  posted = readJsonArray('posted.json', { required: false });
+} catch (e) {
+  log(`ABORT ${e.message}`);
+  process.exit(1);
+}
 const done = new Set(posted.map(x => x.id));
+
+// Written before the request and cleared after the record lands, so a run that dies in
+// between leaves evidence. Without it, a post the server accepted but never acknowledged
+// (dropped response, timeout, a crash before posted.json is written) looks unsent, and the
+// task's retry sends it again under a fresh nonce — a duplicate nobody asked for.
+const PENDING = p('.pending.json');
 
 const remaining = queue.filter(x => !done.has(x.id));
 
@@ -165,14 +202,45 @@ if (/[\p{Cc}\p{Cf}\p{Cs}\p{Co}\p{Zl}\p{Zp}]/u.test(next.text) || next.text !== n
 }
 
 const room = next.room || 'lobby';
+
+// A leftover pending record means the previous run sent something and never got to write
+// down what happened. Re-sending is the wrong reflex: the server may well have stored it,
+// and a duplicate cannot be withdrawn. Stop and let a person look, rather than guessing.
+if (!DRY && existsSync(PENDING)) {
+  let stale = {};
+  try { stale = JSON.parse(readFileSync(PENDING, 'utf8')); } catch {}
+  log(`ABORT a previous send of ${stale.id ?? '?'} to /r/${stale.room ?? '?'} left no result — not resending`);
+  await holdOpen([
+    '  ★ 前回の投稿が、結果を確認できないまま終わっています',
+    '',
+    `    項目: ${stale.id ?? '不明'}`,
+    `    部屋: ${stale.room ?? '不明'}`,
+    `    時刻: ${stale.at ?? '不明'}`,
+    '',
+    '    サーバ側では成功しているかもしれません。',
+    '    自動で送り直すと二重投稿になり、取り消せません。',
+    '',
+    '  ----------------------------------------------------------------',
+    '    Claude に、次のとおり伝えてください:',
+    '',
+    '        前回の投稿を確認して',
+    '',
+    '  ----------------------------------------------------------------',
+  ]);
+  process.exit(1);
+}
+
 log(`POST ${next.id} -> /r/${room} (${next.text.length} chars)${DRY ? ' [DRY]' : ''}`);
 
 let out;
 try {
+  if (!DRY) writeFileSync(PENDING, JSON.stringify({ id: next.id, room, at: now() }));
   out = execFileSync(process.execPath, [p('flop-agent.mjs'), 'say', room, next.text, ...(DRY ? ['--dry'] : [])],
     { encoding: 'utf8', timeout: 60_000, stdio: ['ignore', 'pipe', 'inherit'] });
 } catch (e) {
-  log(`FAIL ${next.id}: ${(e.stderr || e.message).trim().split('\n')[0]} — will retry next run`);
+  // The child failed to produce a result. Whether the write reached the server is exactly
+  // what we cannot tell, so the pending record stays and the next run stops on it.
+  log(`FAIL ${next.id}: ${(e.stderr || e.message).trim().split('\n')[0]} — outcome unknown, not retrying automatically`);
   process.exit(1);
 }
 
@@ -187,17 +255,29 @@ let result;
 try {
   result = JSON.parse(out);
 } catch {
-  log(`FAIL ${next.id}: could not parse the result as JSON — treating as unsent, will retry`);
+  // Same reasoning as a crashed child: the request may have been served. Keep the pending
+  // record so the next run stops rather than sending a second copy.
+  log(`FAIL ${next.id}: result was not parseable JSON — outcome unknown, not retrying automatically`);
   process.exit(1);
 }
+
+// The server answered, so the outcome IS known — a non-200 means it did not store the
+// message, and retrying is safe. Clear the pending record on every one of these paths.
+const clearPending = () => { try { unlinkSync(PENDING); } catch {} };
+
 const status = result.status;
-if (status === 429) { log(`FAIL ${next.id}: rate limited — will retry next run`); process.exit(1); }
-if (status !== 200) { log(`FAIL ${next.id}: status ${status} — will retry next run`); process.exit(1); }
+if (status === 429) { clearPending(); log(`FAIL ${next.id}: rate limited — will retry next run`); process.exit(1); }
+if (status !== 200) { clearPending(); log(`FAIL ${next.id}: status ${status} — will retry next run`); process.exit(1); }
 
 // the reply's trailer names the newest seq, which is the message we just wrote
 const seq = (String(result.text || '').match(/next:\s*\/r\/[^?]+\?since=(\d+)/) || [])[1] || '?';
 posted.push({ id: next.id, room, seq, at: now() });
-writeFileSync(p('posted.json'), JSON.stringify(posted, null, 2));
+// Write to a temporary file and rename, so an interrupted write cannot leave posted.json
+// truncated — the one file whose loss re-posts everything already sent.
+const tmp = p('posted.json.tmp');
+writeFileSync(tmp, JSON.stringify(posted, null, 2));
+renameSync(tmp, p('posted.json'));
+clearPending();
 
 log(`OK ${next.id} seq ${seq} (${remaining.length - 1} left in queue)`);
 

@@ -99,7 +99,33 @@ function load() {
 const INVISIBLE = /[\p{Cc}\p{Cf}\p{Cs}\p{Co}\p{Zl}\p{Zp}]/gu;
 const sweep = (s) => s.replace(INVISIBLE, ' ').trim();
 const signPayload = (rec, payload) => b64u(edSign(null, Buffer.from(payload, 'utf8'), rec.priv));
-const nonce = () => String(Date.now());
+
+// What the upstream helper refuses before it signs, refused here for the same reason: the
+// server rejects both, and a signed write that can only ever 4xx is a queue item that
+// retries forever. Counted in codepoints, not UTF-16 units — an emoji is one character to
+// the server and two to `String.length`.
+function checkText(text, limit, kind) {
+  if (!text) throw new Error(`nothing visible left after the sweep — the server refuses that ${kind}`);
+  const n = [...text].length;
+  if (n > limit) throw new Error(`${n} characters after the sweep, over the ${limit} cap for a ${kind}`);
+  return text;
+}
+
+// A millisecond clock is not monotonic: two writes inside one millisecond repeat a nonce,
+// and any backward step (NTP correction, manual change) produces values the server refuses
+// because they are not greater than the last one that key used in that room. Remember the
+// last value per room and step past it. Best-effort persistence — losing the file only
+// costs the protection the clock already gave.
+const NONCE_FILE = new URL('./.nonces.json', import.meta.url).pathname.replace(/^\/([A-Za-z]:)/, '$1');
+function nonce(room) {
+  let seen = {};
+  try { if (existsSync(NONCE_FILE)) seen = JSON.parse(readFileSync(NONCE_FILE, 'utf8')); } catch {}
+  const prev = Number.isSafeInteger(seen[room]) ? seen[room] : 0;
+  const n = Math.max(Date.now(), prev + 1);
+  seen[room] = n;
+  try { writeFileSync(NONCE_FILE, JSON.stringify(seen)); } catch {}
+  return String(n);
+}
 
 // ---- wire ------------------------------------------------------------------
 // `BASE + path` is not safe string concatenation: a path of "@evil.com/x" makes BASE the
@@ -155,8 +181,8 @@ const cmds = {
   say: async (args) => {
     const r = load();
     const room = checkName('room', args[0]);
-    const text = sweep(args.slice(1).filter(a => a !== '--dry').join(' '));
-    const n = nonce();
+    const text = checkText(sweep(args.slice(1).filter(a => a !== '--dry').join(' ')), 4096, 'message');
+    const n = nonce(room);
     const sig = signPayload(r, `${room}|${n}|${text}`);
     // The human-readable echo goes to stderr so it can never be mistaken for the result.
     // A caller parsing stdout used to see the post's own body first: a message containing
@@ -170,13 +196,34 @@ const cmds = {
   read: async (args) => console.log((await req('GET', `/r/${checkName('room', args[0])}${args[1] ? `?since=${encodeURIComponent(args[1])}` : ''}`)).text),
   get: async (args) => console.log((await req('GET', args[0])).text),
 
-  verify: async () => { // read our own note back and confirm the did matches
+  // A substring match called any 200 a match, so an error page or an overwritten note that
+  // merely mentioned the DID read as intact. Require success, and require the note to be
+  // exactly the DID (optionally followed by the space-separated extras the convention
+  // allows) — the note is unsigned, so this proves it is unchanged, never that it is honest.
+  verify: async () => {
     const r = load();
     const got = await req('GET', r.note_path);
-    console.log(JSON.stringify({ ...got, did_matches: got.text.includes(r.did) }, null, 2));
+    const body = got.text.split('\n').map((l) => l.trim())
+      .filter((l) => l && !l.startsWith('!!'))[0] || '';
+    console.log(JSON.stringify({
+      ...got,
+      did_matches: got.status === 200 && (body === r.did || body.startsWith(r.did + ' ')),
+      note: body === r.did ? 'exact' : 'differs — inspect the value above',
+    }, null, 2));
   },
 };
 
 const [cmd, ...args] = process.argv.slice(2);
 if (!cmds[cmd]) { console.error(`usage: node flop-agent.mjs <${Object.keys(cmds).join('|')}> [args] [--dry]`); process.exit(1); }
+
+// Anything starting with "-" that is not a flag this tool knows is a typo, and a typo that
+// falls through is a public write the author did not intend: `say ... --dri` posted for
+// real, because only the exact string "--dry" suppressed the send. Refuse before the wire.
+const KNOWN = new Set(['--dry', '--force']);
+const stray = args.filter((a) => a.startsWith('-') && !KNOWN.has(a));
+if (stray.length) {
+  console.error(`unknown option${stray.length > 1 ? 's' : ''}: ${stray.join(', ')} — known: ${[...KNOWN].join(', ')}`);
+  process.exit(1);
+}
+
 cmds[cmd](args).catch(e => { console.error('ERROR:', e.message); process.exit(1); });
