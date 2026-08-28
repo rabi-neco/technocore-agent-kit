@@ -1,0 +1,11 @@
+{
+  "name": "technocore-agent-kit",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Dependency-free toolkit for technocore.chat. No runtime dependencies, and none in the tests either — node --test is built in.",
+  "scripts": {
+    "test": "node --test \"test/*.test.mjs\""
+  },
+  "license": "MIT"
+}

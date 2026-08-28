@@ -89,6 +89,28 @@ default, so it will kill the held-open exhaustion notice on its own schedule. Di
 (`<ExecutionTimeLimit>PT0S</ExecutionTimeLimit>` if you register from XML) or the window you
 went to the trouble of keeping open closes without you.
 
+## Tests
+
+```
+npm test
+```
+
+54 cases on `node --test`, which ships with Node — the suite has no dependencies either.
+They run the real CLI in a throwaway directory against a generated key, so nothing touches a
+live identity and nothing posts.
+
+Each case exists because something got through first: the host pin, the room pattern, the
+sweep categories, counting codepoints rather than UTF-16 units, the exit code that separates
+*never sent* from *outcome unknown*. Comments saying **do not remove this** are worth exactly
+as much as the test underneath them, which is the point — prose does not fail a build.
+
+Writing them turned up two more. The helper first used `execFileSync`, which returns only
+stdout, so every assertion reading the composed message compared against an empty string: the
+checking apparatus was broken the same way the code under test had been. And the exhaustion
+path exited 127 on Windows instead of 0, because `process.exit()` after a `fetch()` trips a
+libuv assertion while undici still holds the connection — and a scheduler that reads non-zero
+as failure would have reopened the notice three more times.
+
 ## Keys
 
 `agent.key.json` holds an unencrypted PKCS#8 private key and is gitignored. It is the only

@@ -159,139 +159,151 @@ async function checkForTestnet() {
 }
 const testnetNotice = (!DRY && !process.argv.includes('status')) ? await checkForTestnet() : null;
 
-const next = remaining[0];
-if (!next) {
-  log(`IDLE queue exhausted (${posted.length} posted) — nothing to say, so saying nothing. Add items to queue.json.`);
-  if (!DRY) {
-    // The one line that is an instruction gets its own block. Buried in a paragraph of
-    // equal-weight text it reads as prose; on its own it reads as the thing to do next.
+// Everything past the openapi fetch lives in a function so it can *return* an exit code
+// instead of calling process.exit(). On Windows, process.exit() after a fetch aborts the
+// process with a libuv assertion and code 127 — undici still holds the connection when the
+// handles are torn down. That is not cosmetic here: the scheduled task reads a non-zero
+// code as failure and restarts the run, so closing the exhaustion notice would have opened
+// three more of them over the next fifteen minutes. Letting the loop drain exits cleanly.
+async function main() {
+
+  const next = remaining[0];
+  if (!next) {
+    log(`IDLE queue exhausted (${posted.length} posted) — nothing to say, so saying nothing. Add items to queue.json.`);
+    if (!DRY) {
+      // The one line that is an instruction gets its own block. Buried in a paragraph of
+      // equal-weight text it reads as prose; on its own it reads as the thing to do next.
+      await holdOpen([
+        ...(testnetNotice ? [...testnetNotice, '', ''] : []),
+        '  ★ 投稿キューが空になりました（ネタ切れ）',
+        '',
+        `    これまでに ${posted.length} 件を投稿済みです。`,
+        '    埋め草は投稿しない設計なので、ここで停止しています。',
+        '',
+        '  ----------------------------------------------------------------',
+        '    Claude に、次のとおり伝えてください:',
+        '',
+        '        キュー補充して',
+        '',
+        '  ----------------------------------------------------------------',
+        '',
+        '    補充すれば、次回ログオン時から自動で再開します。',
+      ]);
+    }
+    return 0;
+  }
+
+  // guardrails: the queue is the only content source, and it is human-reviewed
+  if (next.example) {
+    log(`ABORT ${next.id} is a shipped example — replace queue.json with your own material before running`);
+    console.log('\n  queue.json still holds the examples this repo ships with.\n' +
+                '  They are marked "example": true so a fresh clone cannot post them by accident.\n' +
+                '  Write your own items (drop the "example" field) and run again.\n');
+    return 1;
+  }
+  if (next.text.length > 4096) { log(`ABORT ${next.id} exceeds 4096 chars`); return 1; }
+  // Same six Unicode categories the server sweeps, plus the trim it applies. Signing text
+  // the server would rewrite produces a signature that cannot verify, so catch it here
+  // rather than letting the item fail on the wire and retry forever.
+  if (/[\p{Cc}\p{Cf}\p{Cs}\p{Co}\p{Zl}\p{Zp}]/u.test(next.text) || next.text !== next.text.trim()) {
+    log(`ABORT ${next.id} contains characters the single-line sweep would rewrite`); return 1;
+  }
+
+  const room = next.room || 'lobby';
+
+  // A leftover pending record means the previous run sent something and never got to write
+  // down what happened. Re-sending is the wrong reflex: the server may well have stored it,
+  // and a duplicate cannot be withdrawn. Stop and let a person look, rather than guessing.
+  if (!DRY && existsSync(PENDING)) {
+    let stale = {};
+    try { stale = JSON.parse(readFileSync(PENDING, 'utf8')); } catch {}
+    log(`ABORT a previous send of ${stale.id ?? '?'} to /r/${stale.room ?? '?'} left no result — not resending`);
     await holdOpen([
-      ...(testnetNotice ? [...testnetNotice, '', ''] : []),
-      '  ★ 投稿キューが空になりました（ネタ切れ）',
+      '  ★ 前回の投稿が、結果を確認できないまま終わっています',
       '',
-      `    これまでに ${posted.length} 件を投稿済みです。`,
-      '    埋め草は投稿しない設計なので、ここで停止しています。',
+      `    項目: ${stale.id ?? '不明'}`,
+      `    部屋: ${stale.room ?? '不明'}`,
+      `    時刻: ${stale.at ?? '不明'}`,
+      '',
+      '    サーバ側では成功しているかもしれません。',
+      '    自動で送り直すと二重投稿になり、取り消せません。',
       '',
       '  ----------------------------------------------------------------',
       '    Claude に、次のとおり伝えてください:',
       '',
-      '        キュー補充して',
+      '        前回の投稿を確認して',
       '',
       '  ----------------------------------------------------------------',
-      '',
-      '    補充すれば、次回ログオン時から自動で再開します。',
     ]);
+    return 1;
   }
-  process.exit(0);
-}
 
-// guardrails: the queue is the only content source, and it is human-reviewed
-if (next.example) {
-  log(`ABORT ${next.id} is a shipped example — replace queue.json with your own material before running`);
-  console.log('\n  queue.json still holds the examples this repo ships with.\n' +
-              '  They are marked "example": true so a fresh clone cannot post them by accident.\n' +
-              '  Write your own items (drop the "example" field) and run again.\n');
-  process.exit(1);
-}
-if (next.text.length > 4096) { log(`ABORT ${next.id} exceeds 4096 chars`); process.exit(1); }
-// Same six Unicode categories the server sweeps, plus the trim it applies. Signing text
-// the server would rewrite produces a signature that cannot verify, so catch it here
-// rather than letting the item fail on the wire and retry forever.
-if (/[\p{Cc}\p{Cf}\p{Cs}\p{Co}\p{Zl}\p{Zp}]/u.test(next.text) || next.text !== next.text.trim()) {
-  log(`ABORT ${next.id} contains characters the single-line sweep would rewrite`); process.exit(1);
-}
+  log(`POST ${next.id} -> /r/${room} (${next.text.length} chars)${DRY ? ' [DRY]' : ''}`);
 
-const room = next.room || 'lobby';
-
-// A leftover pending record means the previous run sent something and never got to write
-// down what happened. Re-sending is the wrong reflex: the server may well have stored it,
-// and a duplicate cannot be withdrawn. Stop and let a person look, rather than guessing.
-if (!DRY && existsSync(PENDING)) {
-  let stale = {};
-  try { stale = JSON.parse(readFileSync(PENDING, 'utf8')); } catch {}
-  log(`ABORT a previous send of ${stale.id ?? '?'} to /r/${stale.room ?? '?'} left no result — not resending`);
-  await holdOpen([
-    '  ★ 前回の投稿が、結果を確認できないまま終わっています',
-    '',
-    `    項目: ${stale.id ?? '不明'}`,
-    `    部屋: ${stale.room ?? '不明'}`,
-    `    時刻: ${stale.at ?? '不明'}`,
-    '',
-    '    サーバ側では成功しているかもしれません。',
-    '    自動で送り直すと二重投稿になり、取り消せません。',
-    '',
-    '  ----------------------------------------------------------------',
-    '    Claude に、次のとおり伝えてください:',
-    '',
-    '        前回の投稿を確認して',
-    '',
-    '  ----------------------------------------------------------------',
-  ]);
-  process.exit(1);
-}
-
-log(`POST ${next.id} -> /r/${room} (${next.text.length} chars)${DRY ? ' [DRY]' : ''}`);
-
-let out;
-try {
-  if (!DRY) writeFileSync(PENDING, JSON.stringify({ id: next.id, room, at: now() }));
-  out = execFileSync(process.execPath, [p('flop-agent.mjs'), 'say', room, next.text, ...(DRY ? ['--dry'] : [])],
-    { encoding: 'utf8', timeout: 60_000, stdio: ['ignore', 'pipe', 'inherit'] });
-} catch (e) {
-  const why = (e.stderr || e.message).trim().split('\n').pop();
-  // Exit 2 is the child saying it refused before sending anything — a bad room name, empty
-  // or oversized text. Nothing reached the server, so there is nothing to reconcile: drop
-  // the pending record rather than halting every future run with a false "this may already
-  // have been posted". The item still needs fixing, which is why this stops rather than
-  // skipping ahead, but say what is actually wrong.
-  if (e.status === 2) {
-    try { unlinkSync(PENDING); } catch {}
-    log(`ABORT ${next.id} was refused before sending: ${why} — fix the item in queue.json`);
-    process.exit(1);
+  let out;
+  try {
+    if (!DRY) writeFileSync(PENDING, JSON.stringify({ id: next.id, room, at: now() }));
+    out = execFileSync(process.execPath, [p('flop-agent.mjs'), 'say', room, next.text, ...(DRY ? ['--dry'] : [])],
+      { encoding: 'utf8', timeout: 60_000, stdio: ['ignore', 'pipe', 'inherit'] });
+  } catch (e) {
+    const why = (e.stderr || e.message).trim().split('\n').pop();
+    // Exit 2 is the child saying it refused before sending anything — a bad room name, empty
+    // or oversized text. Nothing reached the server, so there is nothing to reconcile: drop
+    // the pending record rather than halting every future run with a false "this may already
+    // have been posted". The item still needs fixing, which is why this stops rather than
+    // skipping ahead, but say what is actually wrong.
+    if (e.status === 2) {
+      try { unlinkSync(PENDING); } catch {}
+      log(`ABORT ${next.id} was refused before sending: ${why} — fix the item in queue.json`);
+      return 1;
+    }
+    // Anything else: the request may have been served and we will never know from here.
+    log(`FAIL ${next.id}: ${why} — outcome unknown, not retrying automatically`);
+    return 1;
   }
-  // Anything else: the request may have been served and we will never know from here.
-  log(`FAIL ${next.id}: ${why} — outcome unknown, not retrying automatically`);
-  process.exit(1);
+
+  if (DRY) { return 0; } // the child echoed the composed message to stderr already
+
+  // Parse the child's stdout as the JSON it is, rather than regexing for the first thing that
+  // looks like a status. The post's own body used to be printed to stdout first, so a message
+  // containing the characters "status": 200 made a failed write parse as a success — and
+  // "status": 429 made a success parse as rate-limited. Both reproduced. The echo now goes to
+  // stderr, and this refuses to guess if stdout is not the single object it expects.
+  let result;
+  try {
+    result = JSON.parse(out);
+  } catch {
+    // Same reasoning as a crashed child: the request may have been served. Keep the pending
+    // record so the next run stops rather than sending a second copy.
+    log(`FAIL ${next.id}: result was not parseable JSON — outcome unknown, not retrying automatically`);
+    return 1;
+  }
+
+  // The server answered, so the outcome IS known — a non-200 means it did not store the
+  // message, and retrying is safe. Clear the pending record on every one of these paths.
+  const clearPending = () => { try { unlinkSync(PENDING); } catch {} };
+
+  const status = result.status;
+  if (status === 429) { clearPending(); log(`FAIL ${next.id}: rate limited — will retry next run`); return 1; }
+  if (status !== 200) { clearPending(); log(`FAIL ${next.id}: status ${status} — will retry next run`); return 1; }
+
+  // the reply's trailer names the newest seq, which is the message we just wrote
+  const seq = (String(result.text || '').match(/next:\s*\/r\/[^?]+\?since=(\d+)/) || [])[1] || '?';
+  posted.push({ id: next.id, room, seq, at: now() });
+  // Write to a temporary file and rename, so an interrupted write cannot leave posted.json
+  // truncated — the one file whose loss re-posts everything already sent.
+  const tmp = p('posted.json.tmp');
+  writeFileSync(tmp, JSON.stringify(posted, null, 2));
+  renameSync(tmp, p('posted.json'));
+  clearPending();
+
+  log(`OK ${next.id} seq ${seq} (${remaining.length - 1} left in queue)`);
+
+  // Post first, then hold — the post is cheap and should not be lost to a window waiting for
+  // someone who is away. Shown on every run while the terms are present, not once: this is
+  // the event the whole exercise is aimed at, and a notice you can miss is not a notice.
+  if (testnetNotice) await holdOpen(testnetNotice);
+
 }
 
-if (DRY) { process.exit(0); } // the child echoed the composed message to stderr already
-
-// Parse the child's stdout as the JSON it is, rather than regexing for the first thing that
-// looks like a status. The post's own body used to be printed to stdout first, so a message
-// containing the characters "status": 200 made a failed write parse as a success — and
-// "status": 429 made a success parse as rate-limited. Both reproduced. The echo now goes to
-// stderr, and this refuses to guess if stdout is not the single object it expects.
-let result;
-try {
-  result = JSON.parse(out);
-} catch {
-  // Same reasoning as a crashed child: the request may have been served. Keep the pending
-  // record so the next run stops rather than sending a second copy.
-  log(`FAIL ${next.id}: result was not parseable JSON — outcome unknown, not retrying automatically`);
-  process.exit(1);
-}
-
-// The server answered, so the outcome IS known — a non-200 means it did not store the
-// message, and retrying is safe. Clear the pending record on every one of these paths.
-const clearPending = () => { try { unlinkSync(PENDING); } catch {} };
-
-const status = result.status;
-if (status === 429) { clearPending(); log(`FAIL ${next.id}: rate limited — will retry next run`); process.exit(1); }
-if (status !== 200) { clearPending(); log(`FAIL ${next.id}: status ${status} — will retry next run`); process.exit(1); }
-
-// the reply's trailer names the newest seq, which is the message we just wrote
-const seq = (String(result.text || '').match(/next:\s*\/r\/[^?]+\?since=(\d+)/) || [])[1] || '?';
-posted.push({ id: next.id, room, seq, at: now() });
-// Write to a temporary file and rename, so an interrupted write cannot leave posted.json
-// truncated — the one file whose loss re-posts everything already sent.
-const tmp = p('posted.json.tmp');
-writeFileSync(tmp, JSON.stringify(posted, null, 2));
-renameSync(tmp, p('posted.json'));
-clearPending();
-
-log(`OK ${next.id} seq ${seq} (${remaining.length - 1} left in queue)`);
-
-// Post first, then hold — the post is cheap and should not be lost to a window waiting for
-// someone who is away. Shown on every run while the terms are present, not once: this is
-// the event the whole exercise is aimed at, and a notice you can miss is not a notice.
-if (testnetNotice) await holdOpen(testnetNotice);
+process.exitCode = (await main()) ?? 0;
