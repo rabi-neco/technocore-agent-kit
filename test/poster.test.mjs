@@ -4,12 +4,12 @@
 // before the network.
 import { test, describe } from 'node:test';
 import assert from 'node:assert/strict';
-import { existsSync, readFileSync, writeFileSync } from 'node:fs';
+import { existsSync, readFileSync, writeFileSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
 import { sandbox, run } from './helpers.mjs';
 
 const withBox = (fn) => () => {
-  const box = sandbox();
+  const box = sandbox({ offline: true });
   try { return fn(box, (...args) => run(box.dir, 'poster.mjs', args)); }
   finally { box.cleanup(); }
 };
@@ -117,10 +117,14 @@ describe('oversized and invisible content is caught before signing', () => {
   // The cap is codepoints, the same unit the server and the child count in. Measuring
   // UTF-16 units here made an emoji cost two against a limit it costs one against
   // everywhere else, so the poster refused messages the server would have taken.
+  // --dry is not optional here. This item is valid, so without it the poster hands it to the
+  // real flop-agent.mjs and `say` sends it: until 2026-11-26 every run of this suite posted
+  // 2049 of these to the live lobby under a throwaway key (confirmed with a stub that logged
+  // ["say","lobby",…] with no --dry). Any test whose item passes every check needs --dry.
   test('counts codepoints, not UTF-16 units', withBox((box, poster) => {
     box.write('queue.json', [{ id: 'astral', room: 'lobby', text: '𝄞'.repeat(2049) }]);
     box.write('posted.json', []);
-    const out = poster().stdout;
+    const out = poster('--dry').stdout;
     assert.doesNotMatch(out, /ABORT/, '2049 codepoints is under the cap');
   }));
 
@@ -181,6 +185,82 @@ describe('exit codes the scheduler acts on', () => {
     box.write('posted.json', []);
     box.write('.pending.json', { id: 'x', room: 'lobby', at: 'earlier' });
     assert.equal(poster().code, 1);
+  }));
+});
+
+describe('a stop that needs a person says what to do', () => {
+  // These used to end with a log line and nothing on screen. Under a pipe there is no window
+  // to hold, so the notice is printed and the exit code stays what the scheduler acts on.
+  test('a queue item that cannot be sent names it and the words to use', withBox((box, poster) => {
+    box.write('queue.json', [{ id: 'big', room: 'lobby', text: 'a'.repeat(4097) }]);
+    box.write('posted.json', []);
+    const r = poster();
+    assert.equal(r.code, 1);
+    assert.match(r.stdout, /投稿を止めています/);
+    assert.match(r.stdout, /対象: big/);
+    assert.match(r.stdout, /queue\.json を直して/);
+  }));
+
+  test('unreadable state is shown too, before anything is fetched', withBox((box, poster) => {
+    box.write('queue.json', [{ id: 'x', room: 'lobby', text: 'hello' }]);
+    box.write('posted.json', 'not json');
+    const r = poster();
+    assert.equal(r.code, 1);
+    assert.match(r.stdout, /queue\.json と posted\.json を確認して/);
+  }));
+});
+
+describe('a DID note that keeps failing to refresh is raised before it is reclaimed', () => {
+  // The refresh runs through the sandbox's offline agent, so it always fails here — which is
+  // the condition under test, reached without writing to the public store.
+  const exhausted = (box) => {
+    box.write('queue.json', [{ id: 'a', text: 'x' }]);
+    box.write('posted.json', [{ id: 'a' }]);
+  };
+
+  test('last success four days ago: notice, with the days left', withBox((box, poster) => {
+    exhausted(box);
+    box.write('.did-refreshed', new Date(Date.now() - 4 * 86400_000).toISOString());
+    const r = poster();
+    assert.match(r.stdout, /DIDノートを確認して/);
+    assert.match(r.stdout, /残り約3日/);
+    // One window for the run, not one per finding: the exhaustion notice shares it.
+    assert.match(r.stdout, /ネタ切れ/);
+    assert.equal(r.stdout.split('='.repeat(64)).length - 1, 2, 'one window, one pair of bars');
+  }));
+
+  test('last success an hour ago: nothing to say', withBox((box, poster) => {
+    exhausted(box);
+    assert.doesNotMatch(poster().stdout, /DIDノート/);
+  }));
+
+  test('no marker at all is a first run, not a failure', withBox((box, poster) => {
+    exhausted(box);
+    rmSync(join(box.dir, '.did-refreshed'));
+    assert.doesNotMatch(poster().stdout, /DIDノート/);
+  }));
+});
+
+describe('the test sandbox itself must not post', () => {
+  // The positive control for the offline agent in helpers.mjs: a valid item, deliberately
+  // without --dry, the exact shape that used to reach the live lobby. If this ever sends,
+  // the guard is gone and every test above is posting for real.
+  test('a sendable item without --dry is stopped at fetch', withBox((box, poster) => {
+    box.write('queue.json', [{ id: 'live', room: 'lobby', text: 'must not be sent' }]);
+    box.write('posted.json', []);
+    const r = poster();
+    assert.match(r.stderr, /test guard: no network from flop-agent\.mjs/);
+    assert.doesNotMatch(r.stdout, /OK live/);
+  }));
+
+  // The same control for the poster's own read of technocore's openapi.json. A read that
+  // reached the server would log "openapi: N paths" instead.
+  test('the openapi read is stopped too', withBox((box, poster) => {
+    box.write('queue.json', [{ id: 'a', text: 'x' }]);
+    box.write('posted.json', [{ id: 'a' }]);
+    const r = poster();
+    assert.match(r.stdout, /openapi check failed: test guard: no network from poster\.mjs/);
+    assert.doesNotMatch(r.stdout, /openapi: \d+ paths/);
   }));
 });
 

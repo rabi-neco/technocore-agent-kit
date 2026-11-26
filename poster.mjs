@@ -4,7 +4,7 @@
 // posting rather than emitting filler. Nothing read from the network is ever posted.
 import { execFileSync } from 'node:child_process';
 import { readFileSync, writeFileSync, existsSync, appendFileSync, unlinkSync, renameSync } from 'node:fs';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import { dirname, join } from 'node:path';
 
 const DIR = dirname(fileURLToPath(import.meta.url));
@@ -23,19 +23,45 @@ const log = (m) => { const l = `${now()} ${m}`; console.log(l); appendFileSync(p
 //
 // Only when a console is actually attached: run from a pipe or a script there is no window
 // to keep open and no keypress coming, so it prints and exits rather than hanging a caller.
+//
+// Resolves true only when a person pressed a key — the one case where someone has seen it.
+// The caller exits 0 then, whatever stopped the run: the task restarts on a non-zero code
+// (every 5 minutes, up to 3 times — measured 2026-11-26), and a restart cannot fix anything
+// a person has to fix. It only reopens the notice they just closed, three more times.
 function holdOpen(lines) {
   const bar = '='.repeat(64);
   console.log(`\n${bar}\n${lines.join('\n')}\n${bar}\n`);
-  if (!process.stdin.isTTY) return Promise.resolve();
+  if (!process.stdin.isTTY) return Promise.resolve(false);
   console.log('  何かキーを押すと閉じます\n');
   return new Promise((done) => {
     try {
       process.stdin.setRawMode(true);
       process.stdin.resume();
-      process.stdin.once('data', () => { try { process.stdin.pause(); } catch {} done(); });
-    } catch { done(); }
+      process.stdin.once('data', () => { try { process.stdin.pause(); } catch {} done(true); });
+    } catch { done(false); }
   });
 }
+
+// What every notice ends with: the one thing to do, set apart so it reads as an instruction.
+const tellClaude = (words) => [
+  '  ----------------------------------------------------------------',
+  '    Claude に、次のとおり伝えてください:',
+  '',
+  `        ${words}`,
+  '',
+  '  ----------------------------------------------------------------',
+];
+
+// A stop that needs a person used to be a log line and nothing else: the run ended, the
+// next one stopped on the same thing, and nothing on screen said so.
+const stoppedNotice = (title, subject, why, words) => [
+  `  ★ 投稿を止めています（${title}）`,
+  '',
+  `    対象: ${subject}`,
+  `    理由: ${why}`,
+  '',
+  ...tellClaude(words),
+];
 
 const DRY = process.argv.includes('--dry');
 
@@ -69,7 +95,13 @@ try {
   posted = readJsonArray('posted.json', { required: false });
 } catch (e) {
   log(`ABORT ${e.message}`);
-  process.exit(1);
+  // Before any fetch, so process.exit() is still safe here (see main() below for why later
+  // exits are not). Not under status or --dry: those are someone at a prompt already.
+  const asked = process.argv.includes('status') || DRY;
+  const seen = asked ? false : await holdOpen(stoppedNotice(
+    'queue.json か posted.json が読めません', 'queue.json / posted.json', e.message,
+    'queue.json と posted.json を確認して'));
+  process.exit(seen ? 0 : 1);
 }
 const done = new Set(posted.map(x => x.id));
 
@@ -125,6 +157,32 @@ async function refreshDidNote() {
 }
 if (!DRY && !process.argv.includes('status')) await refreshDidNote();
 
+// A refresh that keeps failing was a WARN line a day, and then, on day seven, a note that
+// is simply gone. Three days without a success leaves four to notice and fix it. Read after
+// the refresh above, so a run that just succeeded never raises it. No marker at all is a
+// first run, not a failure, and is left alone.
+const DID_STALE_MS = 72 * 60 * 60 * 1000;
+const DID_RECLAIM_MS = 7 * 24 * 60 * 60 * 1000;
+function didStaleNotice() {
+  const stamp = p('.did-refreshed');
+  if (!existsSync(stamp)) return null;
+  const last = Date.parse(readFileSync(stamp, 'utf8').trim());
+  if (!Number.isFinite(last)) return null;
+  const age = Date.now() - last;
+  if (age < DID_STALE_MS) return null;
+  const left = Math.max(0, Math.ceil((DID_RECLAIM_MS - age) / (24 * 60 * 60 * 1000)));
+  log(`WARN DID note not refreshed since ${new Date(last).toISOString()} — about ${left} day(s) before it is reclaimed`);
+  return [
+    '  ★ DIDノートの更新が3日以上成功していません',
+    '',
+    `    最後に成功: ${new Date(last).toISOString()}`,
+    `    消えるまで: 残り約${left}日（7日で回収されます）`,
+    '',
+    ...tellClaude('DIDノートを確認して'),
+  ];
+}
+const didNotice = (!DRY && !process.argv.includes('status')) ? didStaleNotice() : null;
+
 // The airdrop's main phase is testnet inference, not posting here — so the event worth not
 // missing is the faucet opening, and that shows up in the served API surface before it
 // shows up in an announcement. One unauthenticated GET. Every one of these terms is 0
@@ -170,13 +228,38 @@ async function checkForTestnet() {
 }
 const testnetNotice = (!DRY && !process.argv.includes('status')) ? await checkForTestnet() : null;
 
+// Optional and local: official-watch.mjs is not part of the published kit, so a clone has
+// no such file and this does nothing. Where it exists it reads the official guide and the
+// faucet's /limits once a day and says when either changed. It returns a notice and a
+// commit(); the commit — which records what was seen — runs only once a person has closed
+// the window, so a change nobody looked at is raised again the next day.
+async function watchOfficial() {
+  const mod = p('official-watch.mjs');
+  if (!existsSync(mod)) return null;
+  try { return await (await import(pathToFileURL(mod).href)).check({ dir: DIR, log }); }
+  catch (e) { log(`WARN official watch failed: ${e.message}`); return null; }
+}
+const official = (!DRY && !process.argv.includes('status')) ? await watchOfficial() : null;
+
+// Everything this run has to say, gathered into one window shown at the end — not one window
+// per finding, and not only on the paths that happened to hold one open before.
+const notices = [official?.notice, didNotice, testnetNotice].filter(Boolean);
+
 // Everything past the openapi fetch lives in a function so it can *return* an exit code
 // instead of calling process.exit(). On Windows, process.exit() after a fetch aborts the
 // process with a libuv assertion and code 127 — undici still holds the connection when the
 // handles are torn down. That is not cosmetic here: the scheduled task reads a non-zero
 // code as failure and restarts the run, so closing the exhaustion notice would have opened
 // three more of them over the next fifteen minutes. Letting the loop drain exits cleanly.
+//
+// main() returns an exit code, or { code, block } when the stop needs a person — block is the
+// notice for it, shown together with the run's other notices in one window at the end.
 async function main() {
+  // A queue item a person has to fix. The log line stays as it was; the window is new.
+  const stop = (id, why) => {
+    log(`ABORT ${id} ${why}`);
+    return { code: 1, block: DRY ? null : stoppedNotice('キューの項目に問題があります', id, why, 'queue.json を直して') };
+  };
 
   // Reconcile the pending record before deciding what to do, not after choosing an item.
   // Placed later, an exhausted queue returned first and a leftover record was neither
@@ -196,7 +279,7 @@ async function main() {
     } else {
 
     log(`ABORT a previous send of ${stale.id ?? '?'} to /r/${stale.room ?? '?'} left no result — not resending`);
-    await holdOpen([
+    return { code: 1, block: [
       '  ★ 前回の投稿が、結果を確認できないまま終わっています',
       '',
       `    項目: ${stale.id ?? '不明'}`,
@@ -206,61 +289,45 @@ async function main() {
       '    サーバ側では成功しているかもしれません。',
       '    自動で送り直すと二重投稿になり、取り消せません。',
       '',
-      '  ----------------------------------------------------------------',
-      '    Claude に、次のとおり伝えてください:',
-      '',
-      '        前回の投稿を確認して',
-      '',
-      '  ----------------------------------------------------------------',
-    ]);
-    return 1;
+      ...tellClaude('前回の投稿を確認して'),
+    ] };
     }
   }
 
   const next = remaining[0];
   if (!next) {
     log(`IDLE queue exhausted (${posted.length} posted) — nothing to say, so saying nothing. Add items to queue.json.`);
-    if (!DRY) {
-      // The one line that is an instruction gets its own block. Buried in a paragraph of
-      // equal-weight text it reads as prose; on its own it reads as the thing to do next.
-      await holdOpen([
-        ...(testnetNotice ? [...testnetNotice, '', ''] : []),
-        '  ★ 投稿キューが空になりました（ネタ切れ）',
-        '',
-        `    これまでに ${posted.length} 件を投稿済みです。`,
-        '    埋め草は投稿しない設計なので、ここで停止しています。',
-        '',
-        '  ----------------------------------------------------------------',
-        '    Claude に、次のとおり伝えてください:',
-        '',
-        '        キュー補充して',
-        '',
-        '  ----------------------------------------------------------------',
-        '',
-        '    補充すれば、次回ログオン時から自動で再開します。',
-      ]);
-    }
-    return 0;
+    // The one line that is an instruction gets its own block. Buried in a paragraph of
+    // equal-weight text it reads as prose; on its own it reads as the thing to do next.
+    return { code: 0, block: DRY ? null : [
+      '  ★ 投稿キューが空になりました（ネタ切れ）',
+      '',
+      `    これまでに ${posted.length} 件を投稿済みです。`,
+      '    埋め草は投稿しない設計なので、ここで停止しています。',
+      '',
+      ...tellClaude('キュー補充して'),
+      '',
+      '    補充すれば、次回ログオン時から自動で再開します。',
+    ] };
   }
 
   // guardrails: the queue is the only content source, and it is human-reviewed
   if (next.example) {
-    log(`ABORT ${next.id} is a shipped example — replace queue.json with your own material before running`);
     console.log('\n  queue.json still holds the examples this repo ships with.\n' +
                 '  They are marked "example": true so a fresh clone cannot post them by accident.\n' +
                 '  Write your own items (drop the "example" field) and run again.\n');
-    return 1;
+    return stop(next.id, 'is a shipped example — replace queue.json with your own material before running');
   }
   // Codepoints, matching the server and the child. Counting UTF-16 units here while the
   // child counted codepoints meant an emoji cost two against the cap in one place and one in
   // the other, so a message the server would have accepted was refused before it was sent.
-  if (typeof next.text !== 'string') { log(`ABORT ${next.id} has no text`); return 1; }
-  if ([...next.text].length > 4096) { log(`ABORT ${next.id} exceeds 4096 characters`); return 1; }
+  if (typeof next.text !== 'string') return stop(next.id, 'has no text');
+  if ([...next.text].length > 4096) return stop(next.id, 'exceeds 4096 characters');
   // Same six Unicode categories the server sweeps, plus the trim it applies. Signing text
   // the server would rewrite produces a signature that cannot verify, so catch it here
   // rather than letting the item fail on the wire and retry forever.
   if (/[\p{Cc}\p{Cf}\p{Cs}\p{Co}\p{Zl}\p{Zp}]/u.test(next.text) || next.text !== next.text.trim()) {
-    log(`ABORT ${next.id} contains characters the single-line sweep would rewrite`); return 1;
+    return stop(next.id, 'contains characters the single-line sweep would rewrite');
   }
 
   const room = next.room || 'lobby';
@@ -285,8 +352,7 @@ async function main() {
     // skipping ahead, but say what is actually wrong.
     if (e.status === 2) {
       dropPending();
-      log(`ABORT ${next.id} was refused before sending: ${why} — fix the item in queue.json`);
-      return 1;
+      return stop(next.id, `was refused before sending: ${why} — fix the item in queue.json`);
     }
     // Anything else: the request may have been served and we will never know from here.
     log(`FAIL ${next.id}: ${why} — outcome unknown, not retrying automatically`);
@@ -341,12 +407,18 @@ async function main() {
   dropPending();
 
   log(`OK ${next.id} seq ${seq} (${remaining.length - 1} left in queue)`);
-
-  // Post first, then hold — the post is cheap and should not be lost to a window waiting for
-  // someone who is away. Shown on every run while the terms are present, not once: this is
-  // the event the whole exercise is aimed at, and a notice you can miss is not a notice.
-  if (testnetNotice) await holdOpen(testnetNotice);
-
+  return 0;
 }
 
-process.exitCode = (await main()) ?? 0;
+// Post first, then hold — the post is cheap and should not be lost to a window waiting for
+// someone who is away. The notices are shown on every run while their condition holds, not
+// once: a notice you can miss is not a notice.
+const r = await main();
+const { code, block } = typeof r === 'number' ? { code: r, block: null } : r;
+const blocks = [...notices, ...(block ? [block] : [])];
+const seen = blocks.length ? await holdOpen(blocks.flatMap((b, i) => (i ? ['', '', ...b] : b))) : false;
+// Record what the official watch saw only after a person has seen it (see watchOfficial).
+if (seen && official?.commit) {
+  try { official.commit(); } catch (e) { log(`WARN could not record the official state: ${e.message}`); }
+}
+process.exitCode = seen ? 0 : code;

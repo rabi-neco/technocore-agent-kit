@@ -12,10 +12,30 @@ import { dirname, join } from 'node:path';
 
 const SRC = dirname(dirname(fileURLToPath(import.meta.url)));
 
-export function sandbox({ withKey = true } = {}) {
+export function sandbox({ withKey = true, offline = false } = {}) {
   const dir = mkdtempSync(join(tmpdir(), 'flop-test-'));
   for (const f of ['flop-agent.mjs', 'poster.mjs']) cpSync(join(SRC, f), join(dir, f));
   if (withKey) run(dir, 'flop-agent.mjs', ['keygen']);
+
+  // For the poster's tests: both scripts run for real, with fetch replaced by a throw.
+  //  - flop-agent.mjs: the poster hands any item that passes its checks to it, and a `say`
+  //    without --dry sends it. One test did exactly that on every run until 2026-11-26,
+  //    posting to the live lobby under a throwaway key. Every check the agent makes before
+  //    the network still runs (a bad room still exits 2); nothing it would send leaves. This
+  //    also stops the DID-note refresh, which is the same agent's `publish`.
+  //  - poster.mjs: it reads technocore's openapi.json on every run, so the suite made about
+  //    fifteen requests per run, against the rule that only /rooms may be reached. A failed
+  //    read is already handled (a WARN line, no notice), so nothing else changes.
+  // Each wrapper keeps the original file's name, so nothing that calls it needs to know.
+  if (offline) {
+    for (const f of ['flop-agent.mjs', 'poster.mjs']) {
+      const real = f.replace('.mjs', '.real.mjs');
+      cpSync(join(dir, f), join(dir, real));
+      writeFileSync(join(dir, f),
+        `globalThis.fetch = async () => { throw new Error('test guard: no network from ${f}'); };\n` +
+        `await import('./${real}');\n`);
+    }
+  }
 
   // The poster republishes its DID note unless one was written in the last day, and each
   // sandbox has a fresh key — so without this, every poster test tried to write a junk note
