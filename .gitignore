@@ -17,15 +17,59 @@ posted.json.tmp
 # Listing them here means git will not stage them even if they land in this
 # directory. (This repo's own README.md is tracked and unaffected.)
 CLAUDE.md
-CODEX-検査要件.md
 check-publish.mjs
 audit-claude-md.mjs
-codex-review*.md
+verify-pending.mjs
 data.js
 data2.js
+codex/
+CODEX-検査要件.md
+codex-review*.md
+codex-stdout*.log
+run-codex.ps1
 *_判定ページ.html
 *.xml
 agent.json
 llms.txt
 patterns.md
 skill.md
+
+# BEGIN managed local exclusions (GH-003)
+# OS・作業中の一時ファイル
+.DS_Store
+Thumbs.db
+[Dd]esktop.ini
+*.swp
+*.swo
+
+# Node.js
+node_modules/
+.npm/
+.yarn/cache/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+.pnpm-debug.log*
+.eslintcache
+coverage/
+
+# 環境設定・ローカル認証情報（値は出力・複製しない）
+.env
+.env.*
+.dev.vars
+.dev.vars.*
+!.env.example
+!.env.sample
+!.env.template
+!.env.*.example
+!.env.*.sample
+!.env.*.template
+!.dev.vars.example
+!.dev.vars.sample
+!.dev.vars.template
+
+# この除外設定自体はGitに記録する
+!/.gitignore
+
+# END managed local exclusions (GH-003)
