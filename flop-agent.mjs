@@ -152,11 +152,13 @@ const checkName = (kind, v) => {
 let attempted = false;
 
 async function req(method, path, body) {
+  // Validate first: a path url() refuses never leaves this machine, so it must exit 2, not 1.
+  const target = url(path);
   attempted = true;
   // url() pins the first hop only, and fetch follows redirects by default — a 307 from the
   // pinned host would carry the DID, signature, nonce and body to wherever it pointed. This
   // protocol never redirects, so treat one as an error rather than a route.
-  const res = await fetch(url(path), {
+  const res = await fetch(target, {
     method,
     redirect: 'error',
     signal: AbortSignal.timeout(30_000),
